@@ -1,0 +1,171 @@
+name: Build SpotiFLAC Docker image
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "SpotiFLAC version, e.g. 7.2.2. Leave empty for latest."
+        required: false
+        type: string
+        default: ""
+      force:
+        description: "Force rebuild even if this version already exists"
+        required: false
+        type: boolean
+        default: false
+
+  schedule:
+    - cron: "23 */12 * * *"
+
+concurrency:
+  group: spotiflac-image-build
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: read
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      image: ${{ steps.vars.outputs.image }}
+      should_build: ${{ steps.exists.outputs.should_build }}
+
+    steps:
+      - name: Resolve image name
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve SpotiFLAC version
+        id: version
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${INPUT_VERSION:-}" ]; then
+            VERSION="${INPUT_VERSION#v}"
+          else
+            TAG="$(
+              curl -fsSL \
+                -H "Accept: application/vnd.github+json" \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                https://api.github.com/repos/spotbye/SpotiFLAC/releases/latest \
+              | jq -r '.tag_name // empty'
+            )"
+
+            if [ -z "$TAG" ]; then
+              echo "Could not resolve latest SpotiFLAC release."
+              exit 1
+            fi
+
+            VERSION="${TAG#v}"
+          fi
+
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Unexpected version: $VERSION"
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved SpotiFLAC version: $VERSION"
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Check whether image already exists
+        id: exists
+        shell: bash
+        env:
+          IMAGE: ${{ steps.vars.outputs.image }}
+          VERSION: ${{ steps.version.outputs.version }}
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force || false }}
+        run: |
+          set -euo pipefail
+
+          if [ "${FORCE:-false}" = "true" ]; then
+            echo "Force rebuild requested."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if docker buildx imagetools inspect \
+              "${IMAGE}:${VERSION}" >/dev/null 2>&1; then
+            echo "Image ${IMAGE}:${VERSION} already exists. Nothing to do."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Image ${IMAGE}:${VERSION} does not exist. Build required."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+
+  build:
+    needs: resolve
+
+    if: needs.resolve.outputs.should_build == 'true'
+
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push multi-platform image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+
+          platforms: |
+            linux/amd64
+            linux/arm64
+
+          build-args: |
+            SPOTIFLAC_VERSION=${{ needs.resolve.outputs.version }}
+
+          tags: |
+            ${{ needs.resolve.outputs.image }}:${{ needs.resolve.outputs.version }}
+            ${{ needs.resolve.outputs.image }}:latest
+
+          labels: |
+            org.opencontainers.image.title=SpotiFLAC Docker
+            org.opencontainers.image.version=${{ needs.resolve.outputs.version }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.url=https://github.com/spotbye/SpotiFLAC
+
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
