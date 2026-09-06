@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=SpotiFLAC Verification Browser
+Comment=Lightweight verification browser for SpotiFLAC
+Exec=/usr/local/bin/spotiflac-browser %u
+Terminal=false
+Type=Application
+NoDisplay=true
+MimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;
